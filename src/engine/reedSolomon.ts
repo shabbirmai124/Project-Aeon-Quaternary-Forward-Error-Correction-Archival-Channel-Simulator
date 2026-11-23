@@ -1,13 +1,8 @@
-/**
- * Project Aeon — Galois Field GF(2^8) Reed-Solomon Forward Error Correction
- * Primitive polynomial: x^8 + x^4 + x^3 + x^2 + 1 (0x11D), matching reedsolo / CCSDS.
- * Implements Berlekamp-Massey error locator, Chien search, and Forney error magnitudes.
- */
-
+// Galois Field GF(2^8) with primitive polynomial 0x11d (x^8 + x^4 + x^3 + x^2 + 1)
 const GF_EXP = new Uint8Array(512);
 const GF_LOG = new Uint8Array(256);
 
-(function initGaloisField() {
+(() => {
   let x = 1;
   for (let i = 0; i < 255; i++) {
     GF_EXP[i] = x;
@@ -28,7 +23,7 @@ export function gfMul(a: number, b: number): number {
 }
 
 export function gfDiv(a: number, b: number): number {
-  if (b === 0) throw new Error('Division by zero in GF(256)');
+  if (b === 0) throw new Error('GF division by zero');
   if (a === 0) return 0;
   return GF_EXP[(GF_LOG[a] + 255 - GF_LOG[b]) % 255];
 }
@@ -36,51 +31,52 @@ export function gfDiv(a: number, b: number): number {
 export function gfPow(a: number, power: number): number {
   if (power === 0) return 1;
   if (a === 0) return 0;
-  const exp = (GF_LOG[a] * power) % 255;
-  return GF_EXP[exp < 0 ? exp + 255 : exp];
+  const idx = ((GF_LOG[a] * power) % 255 + 255) % 255;
+  return GF_EXP[idx];
 }
 
 export function gfInv(a: number): number {
-  if (a === 0) throw new Error('Zero has no multiplicative inverse in GF(256)');
+  if (a === 0) throw new Error('GF inverse of zero');
   return GF_EXP[255 - GF_LOG[a]];
 }
 
-function polyScale(p: Uint8Array, scalar: number): Uint8Array {
-  const out = new Uint8Array(p.length);
-  for (let i = 0; i < p.length; i++) {
-    out[i] = gfMul(p[i], scalar);
-  }
-  return out;
-}
-
-function polyAdd(p: Uint8Array, q: Uint8Array): Uint8Array {
-  const len = Math.max(p.length, q.length);
-  const out = new Uint8Array(len);
-  for (let i = 0; i < p.length; i++) {
-    out[i + len - p.length] = p[i];
-  }
-  for (let i = 0; i < q.length; i++) {
-    out[i + len - q.length] ^= q[i];
-  }
-  return out;
-}
-
-function polyMul(p: Uint8Array, q: Uint8Array): Uint8Array {
-  const out = new Uint8Array(p.length + q.length - 1);
+// Polynomial helpers where index 0 is highest degree (big-endian coefficient order)
+function gfPolyMul(p: Uint8Array, q: Uint8Array): Uint8Array {
+  const res = new Uint8Array(p.length + q.length - 1);
   for (let j = 0; j < q.length; j++) {
     for (let i = 0; i < p.length; i++) {
-      out[i + j] ^= gfMul(p[i], q[j]);
+      res[i + j] ^= gfMul(p[i], q[j]);
     }
   }
-  return out;
+  return res;
 }
 
-function polyEval(p: Uint8Array, x: number): number {
-  let y = p[0];
-  for (let i = 1; i < p.length; i++) {
-    y = gfMul(y, x) ^ p[i];
+function gfPolyEval(poly: Uint8Array, x: number): number {
+  let y = poly[0];
+  for (let i = 1; i < poly.length; i++) {
+    y = gfMul(y, x) ^ poly[i];
   }
   return y;
+}
+
+function gfPolyScale(p: Uint8Array, x: number): Uint8Array {
+  const res = new Uint8Array(p.length);
+  for (let i = 0; i < p.length; i++) {
+    res[i] = gfMul(p[i], x);
+  }
+  return res;
+}
+
+function gfPolyAdd(p: Uint8Array, q: Uint8Array): Uint8Array {
+  const len = Math.max(p.length, q.length);
+  const res = new Uint8Array(len);
+  for (let i = 0; i < p.length; i++) {
+    res[i + len - p.length] = p[i];
+  }
+  for (let i = 0; i < q.length; i++) {
+    res[i + len - q.length] ^= q[i];
+  }
+  return res;
 }
 
 const generatorCache = new Map<number, Uint8Array>();
@@ -88,85 +84,74 @@ const generatorCache = new Map<number, Uint8Array>();
 export function rsGeneratorPoly(nsym: number): Uint8Array {
   const cached = generatorCache.get(nsym);
   if (cached) return cached;
-
-  let g = new Uint8Array([1]);
+  let g: Uint8Array = new Uint8Array([1]);
   for (let i = 0; i < nsym; i++) {
-    g = polyMul(g, new Uint8Array([1, GF_EXP[i]]));
+    g = gfPolyMul(g, new Uint8Array([1, gfPow(2, i)]));
   }
   generatorCache.set(nsym, g);
   return g;
 }
 
-/**
- * Encodes a single message block (length <= 255 - nsym) into a codeword of length msg.length + nsym.
- */
-export function rsEncodeBlock(msg: Uint8Array, nsym: number): Uint8Array {
-  if (nsym < 2 || nsym > 200) {
-    throw new Error(`Invalid Reed-Solomon parity count: ${nsym}`);
+export function rsEncodeBlock(msgIn: Uint8Array, nsym: number): Uint8Array {
+  if (msgIn.length + nsym > 255) {
+    throw new Error(`Block too long: ${msgIn.length} + ${nsym} > 255`);
   }
-  if (msg.length + nsym > 255) {
-    throw new Error(`Block too long for GF(256): ${msg.length} + ${nsym} > 255`);
-  }
-
   const gen = rsGeneratorPoly(nsym);
-  const out = new Uint8Array(msg.length + nsym);
-  out.set(msg, 0);
+  const msgOut = new Uint8Array(msgIn.length + nsym);
+  msgOut.set(msgIn, 0);
 
-  for (let i = 0; i < msg.length; i++) {
-    const coef = out[i];
+  for (let i = 0; i < msgIn.length; i++) {
+    const coef = msgOut[i];
     if (coef !== 0) {
       for (let j = 1; j < gen.length; j++) {
-        out[i + j] ^= gfMul(gen[j], coef);
+        msgOut[i + j] ^= gfMul(gen[j], coef);
       }
     }
   }
 
-  // Restore original systematic message bytes; remainder stays in parity suffix
-  out.set(msg, 0);
-  return out;
+  // Restore message bytes (remainder stays in trailing nsym bytes)
+  msgOut.set(msgIn, 0);
+  return msgOut;
+}
+
+export interface RsBlockDecodeResult {
+  data: Uint8Array;
+  correctedErrors: number;
+  uncorrectable: boolean;
 }
 
 function calcSyndromes(msg: Uint8Array, nsym: number): Uint8Array {
   const synd = new Uint8Array(nsym + 1);
-  synd[0] = 0;
+  // synd[0] = 0 padding, synd[i+1] = msg(2^i)
   for (let i = 0; i < nsym; i++) {
-    synd[i + 1] = polyEval(msg, GF_EXP[i]);
+    synd[i + 1] = gfPolyEval(msg, gfPow(2, i));
   }
   return synd;
 }
 
-function hasSyndromeError(synd: Uint8Array): boolean {
-  for (let i = 1; i < synd.length; i++) {
-    if (synd[i] !== 0) return true;
-  }
-  return false;
-}
-
-/**
- * Berlekamp-Massey algorithm returning error locator polynomial in descending powers (highest degree first).
- */
 function findErrorLocator(synd: Uint8Array, nsym: number): Uint8Array | null {
-  let errLoc = new Uint8Array([1]);
-  let oldLoc = new Uint8Array([1]);
+  let errLoc: Uint8Array = new Uint8Array([1]);
+  let oldLoc: Uint8Array = new Uint8Array([1]);
 
   for (let i = 0; i < nsym; i++) {
-    let delta = synd[i + 1];
+    const K = i + 1; // 1-indexed syndrome offset
+    let delta = synd[K];
     for (let j = 1; j < errLoc.length; j++) {
-      delta ^= gfMul(errLoc[errLoc.length - 1 - j], synd[i + 1 - j]);
+      delta ^= gfMul(errLoc[errLoc.length - 1 - j], synd[K - j]);
     }
 
-    // Shift oldLoc by x
+    // Shift oldLoc left (multiply by x)
     const shiftedOld = new Uint8Array(oldLoc.length + 1);
     shiftedOld.set(oldLoc, 0);
     oldLoc = shiftedOld;
 
     if (delta !== 0) {
       if (oldLoc.length > errLoc.length) {
-        const newLoc = polyScale(oldLoc, delta);
-        oldLoc = polyScale(errLoc, gfInv(delta));
+        const newLoc = gfPolyScale(oldLoc, delta);
+        oldLoc = gfPolyScale(errLoc, gfInv(delta));
         errLoc = newLoc;
       }
-      errLoc = polyAdd(errLoc, polyScale(oldLoc, delta));
+      errLoc = gfPolyAdd(errLoc, gfPolyScale(oldLoc, delta));
     }
   }
 
@@ -175,114 +160,101 @@ function findErrorLocator(synd: Uint8Array, nsym: number): Uint8Array | null {
   while (firstNonZero < errLoc.length && errLoc[firstNonZero] === 0) {
     firstNonZero++;
   }
-  const trimmed = errLoc.slice(firstNonZero);
-  const errs = trimmed.length - 1;
+  errLoc = errLoc.slice(firstNonZero);
+
+  const errs = errLoc.length - 1;
   if (errs * 2 > nsym) {
     return null;
   }
-  return trimmed;
+  return errLoc;
 }
 
-/**
- * Chien search to find byte indices of corrupted symbols.
- */
-function findErrorPositions(errLoc: Uint8Array, msgLen: number): number[] | null {
+function findErrors(errLoc: Uint8Array, n: number): number[] | null {
   const errs = errLoc.length - 1;
-  const positions: number[] = [];
-  for (let i = 0; i < msgLen; i++) {
-    if (polyEval(errLoc, GF_EXP[i]) === 0) {
-      positions.push(msgLen - 1 - i);
+  const errPos: number[] = [];
+  for (let i = 0; i < n; i++) {
+    if (gfPolyEval(errLoc, gfPow(2, 255 - i)) === 0) {
+      errPos.push(n - 1 - i);
     }
   }
-  if (positions.length !== errs) {
+  if (errPos.length !== errs) {
     return null;
   }
-  return positions;
+  return errPos;
 }
 
-/**
- * Forney algorithm to compute exact byte error magnitudes and correct them in-place.
- */
 function correctErrata(
   msgIn: Uint8Array,
   synd: Uint8Array,
-  errPos: number[]
+  errPos: number[],
 ): Uint8Array {
   const msg = new Uint8Array(msgIn);
-  const coefPos = errPos.map((p) => msg.length - 1 - p);
+  const n = msg.length;
 
-  // Build error locator from positions (ascending power convention for Forney)
-  let errLoc = new Uint8Array([1]);
-  for (const pos of coefPos) {
-    errLoc = polyMul(errLoc, polyAdd(new Uint8Array([1]), new Uint8Array([GF_EXP[pos], 0])));
+  // coefPos: degree positions (n - 1 - pos)
+  const coefPos = errPos.map((p) => n - 1 - p);
+
+  // Build error locator polynomial from coefPos
+  let errLoc: Uint8Array = new Uint8Array([1]);
+  for (const c of coefPos) {
+    errLoc = gfPolyMul(errLoc, new Uint8Array([gfPow(2, c), 1]));
   }
 
-  // Reverse syndromes (dropping leading 0) for evaluator polynomial
-  const syndRev = new Uint8Array(synd.length - 1);
-  for (let i = 0; i < syndRev.length; i++) {
-    syndRev[i] = synd[synd.length - 1 - i];
+  // Reverse synd[1..] so highest degree is first
+  const revSynd = new Uint8Array(synd.length - 1);
+  for (let i = 0; i < revSynd.length; i++) {
+    revSynd[i] = synd[synd.length - 1 - i];
   }
 
-  // Omega(x) = (Synd(x) * ErrLoc(x)) mod x^(nsym)
-  const product = polyMul(syndRev, errLoc);
-  const errEval = product.slice(product.length - errLoc.length);
+  // errEval = (revSynd * errLoc) mod x^errPos.length (keep last errPos.length coeffs)
+  const prod = gfPolyMul(revSynd, errLoc);
+  const errEval = prod.slice(prod.length - errPos.length);
 
-  // X_l = alpha^(coefPos[l])
-  const X = coefPos.map((pos) => GF_EXP[pos]);
-  const E = new Uint8Array(msg.length);
+  // X_j values
+  const X = coefPos.map((c) => gfPow(2, c));
 
   for (let i = 0; i < X.length; i++) {
-    const XiInv = gfInv(X[i]);
+    const Xi = X[i];
+    const XiInv = gfInv(Xi);
 
-    // Formal derivative of errLoc evaluated at XiInv via product of (1 - X_j * XiInv) for j != i
-    let errLocPrime = 1;
+    // Formal derivative of errLoc evaluated at XiInv
+    let errLocPrimeTmp = 1;
     for (let j = 0; j < X.length; j++) {
       if (j !== i) {
-        errLocPrime = gfMul(errLocPrime, 1 ^ gfMul(XiInv, X[j]));
+        errLocPrimeTmp = gfMul(errLocPrimeTmp, 1 ^ gfMul(XiInv, X[j]));
       }
     }
-    if (errLocPrime === 0) {
-      throw new Error('Reed-Solomon Forney denominator zero');
+    if (errLocPrimeTmp === 0) {
+      throw new Error('Zero denominator in Forney algorithm');
     }
 
-    const y = polyEval(errEval, XiInv);
-    const magnitude = gfDiv(y, errLocPrime);
-    E[errPos[i]] = magnitude;
+    const y = gfPolyEval(errEval, XiInv);
+    const magnitude = gfDiv(y, errLocPrimeTmp);
+    msg[errPos[i]] ^= magnitude;
   }
 
-  for (let i = 0; i < msg.length; i++) {
-    msg[i] ^= E[i];
-  }
   return msg;
 }
 
-export interface RsBlockDecodeResult {
-  data: Uint8Array;
-  correctedSymbols: number;
-  correctedPositions: number[];
-  uncorrectable: boolean;
-}
-
-/**
- * Decodes a single Reed-Solomon codeword of length dataLen + nsym.
- */
-export function rsDecodeBlock(codeword: Uint8Array, nsym: number): RsBlockDecodeResult {
-  const dataLen = codeword.length - nsym;
+export function rsDecodeBlock(msgIn: Uint8Array, nsym: number): RsBlockDecodeResult {
+  const dataLen = msgIn.length - nsym;
   if (dataLen <= 0) {
-    return {
-      data: new Uint8Array(0),
-      correctedSymbols: 0,
-      correctedPositions: [],
-      uncorrectable: true,
-    };
+    return { data: new Uint8Array(0), correctedErrors: 0, uncorrectable: true };
   }
 
-  const synd = calcSyndromes(codeword, nsym);
-  if (!hasSyndromeError(synd)) {
+  const synd = calcSyndromes(msgIn, nsym);
+  let hasError = false;
+  for (let i = 1; i < synd.length; i++) {
+    if (synd[i] !== 0) {
+      hasError = true;
+      break;
+    }
+  }
+
+  if (!hasError) {
     return {
-      data: codeword.slice(0, dataLen),
-      correctedSymbols: 0,
-      correctedPositions: [],
+      data: msgIn.slice(0, dataLen),
+      correctedErrors: 0,
       uncorrectable: false,
     };
   }
@@ -290,159 +262,177 @@ export function rsDecodeBlock(codeword: Uint8Array, nsym: number): RsBlockDecode
   const errLoc = findErrorLocator(synd, nsym);
   if (!errLoc) {
     return {
-      data: codeword.slice(0, dataLen),
-      correctedSymbols: 0,
-      correctedPositions: [],
+      data: msgIn.slice(0, dataLen),
+      correctedErrors: 0,
       uncorrectable: true,
     };
   }
 
-  // Reverse errLoc for Chien search (since findErrorLocator stores highest degree first)
-  const errLocRev = new Uint8Array(errLoc.length);
-  for (let i = 0; i < errLoc.length; i++) {
-    errLocRev[i] = errLoc[errLoc.length - 1 - i];
-  }
-
-  const errPos = findErrorPositions(errLocRev, codeword.length);
+  const errPos = findErrors(errLoc, msgIn.length);
   if (!errPos) {
     return {
-      data: codeword.slice(0, dataLen),
-      correctedSymbols: 0,
-      correctedPositions: [],
+      data: msgIn.slice(0, dataLen),
+      correctedErrors: 0,
       uncorrectable: true,
     };
   }
 
   try {
-    const corrected = correctErrata(codeword, synd, errPos);
-    const verifySynd = calcSyndromes(corrected, nsym);
-    if (hasSyndromeError(verifySynd)) {
-      return {
-        data: codeword.slice(0, dataLen),
-        correctedSymbols: 0,
-        correctedPositions: [],
-        uncorrectable: true,
-      };
+    const repaired = correctErrata(msgIn, synd, errPos);
+    const checkSynd = calcSyndromes(repaired, nsym);
+    for (let i = 1; i < checkSynd.length; i++) {
+      if (checkSynd[i] !== 0) {
+        return {
+          data: msgIn.slice(0, dataLen),
+          correctedErrors: 0,
+          uncorrectable: true,
+        };
+      }
     }
     return {
-      data: corrected.slice(0, dataLen),
-      correctedSymbols: errPos.length,
-      correctedPositions: errPos,
+      data: repaired.slice(0, dataLen),
+      correctedErrors: errPos.length,
       uncorrectable: false,
     };
   } catch {
     return {
-      data: codeword.slice(0, dataLen),
-      correctedSymbols: 0,
-      correctedPositions: [],
+      data: msgIn.slice(0, dataLen),
+      correctedErrors: 0,
       uncorrectable: true,
     };
   }
 }
 
-export interface RsStreamEncodeResult {
-  encoded: Uint8Array;
+export interface RsEncodedPayload {
+  bytes: Uint8Array;
   blockCount: number;
-  dataBytesPerBlock: number;
-  parityPerBlock: number;
-  totalParityBytes: number;
+  dataBlockSize: number;
+  nsym: number;
+  originalLength: number;
 }
 
-/**
- * Encodes an arbitrary byte stream into framed GF(256) Reed-Solomon blocks.
- * Each block carries up to (255 - nsym) message bytes + nsym parity bytes.
- */
-export function rsEncodeStream(data: Uint8Array, nsym = 64): RsStreamEncodeResult {
-  const safeNsym = Math.max(4, Math.min(150, nsym));
-  const maxDataPerBlock = 255 - safeNsym;
-  const blockCount = Math.max(1, Math.ceil(data.length / maxDataPerBlock));
-  const chunks: Uint8Array[] = [];
-  let totalLen = 0;
-
-  for (let b = 0; b < blockCount; b++) {
-    const start = b * maxDataPerBlock;
-    const end = Math.min(data.length, start + maxDataPerBlock);
-    const slice = data.slice(start, end);
-    const codeword = rsEncodeBlock(slice, safeNsym);
-    chunks.push(codeword);
-    totalLen += codeword.length;
+export function rsEncode(data: Uint8Array, nsym: number): RsEncodedPayload {
+  const clampedNsym = Math.max(4, Math.min(180, nsym));
+  const dataBlockSize = 255 - clampedNsym;
+  if (data.length === 0) {
+    const emptyBlock = rsEncodeBlock(new Uint8Array(1), clampedNsym);
+    return {
+      bytes: emptyBlock,
+      blockCount: 1,
+      dataBlockSize,
+      nsym: clampedNsym,
+      originalLength: 0,
+    };
   }
 
-  const encoded = new Uint8Array(totalLen);
-  let offset = 0;
-  for (const chunk of chunks) {
-    encoded.set(chunk, offset);
-    offset += chunk.length;
+  const blocks: Uint8Array[] = [];
+  let totalLen = 0;
+  for (let offset = 0; offset < data.length; offset += dataBlockSize) {
+    const chunk = data.slice(offset, Math.min(offset + dataBlockSize, data.length));
+    const encodedBlock = rsEncodeBlock(chunk, clampedNsym);
+    blocks.push(encodedBlock);
+    totalLen += encodedBlock.length;
+  }
+
+  const combined = new Uint8Array(totalLen);
+  let pos = 0;
+  for (const b of blocks) {
+    combined.set(b, pos);
+    pos += b.length;
   }
 
   return {
-    encoded,
-    blockCount,
-    dataBytesPerBlock: maxDataPerBlock,
-    parityPerBlock: safeNsym,
-    totalParityBytes: blockCount * safeNsym,
+    bytes: combined,
+    blockCount: blocks.length,
+    dataBlockSize,
+    nsym: clampedNsym,
+    originalLength: data.length,
   };
 }
 
-export interface RsStreamDecodeResult {
-  decoded: Uint8Array;
-  totalBlocks: number;
-  repairedBlocks: number;
+export interface RsDecodeReport {
+  bytes: Uint8Array;
+  correctedErrors: number;
   uncorrectableBlocks: number;
-  totalCorrectedSymbols: number;
-  success: boolean;
+  totalBlocks: number;
+  blockResults: Array<{
+    blockIndex: number;
+    correctedErrors: number;
+    uncorrectable: boolean;
+    dataBytes: number;
+  }>;
 }
 
-/**
- * Decodes a framed GF(256) Reed-Solomon byte stream back to its original length.
- */
-export function rsDecodeStream(
+export function rsDecode(
   encoded: Uint8Array,
+  nsym: number,
   originalLength: number,
-  nsym = 64
-): RsStreamDecodeResult {
-  const safeNsym = Math.max(4, Math.min(150, nsym));
-  const maxDataPerBlock = 255 - safeNsym;
-  const blockCount = Math.max(1, Math.ceil(originalLength / maxDataPerBlock));
+): RsDecodeReport {
+  const clampedNsym = Math.max(4, Math.min(180, nsym));
+  const dataBlockSize = 255 - clampedNsym;
+  const fullBlockSize = 255;
 
-  const decoded = new Uint8Array(originalLength);
-  let encOffset = 0;
-  let decOffset = 0;
-  let repairedBlocks = 0;
+  if (originalLength === 0) {
+    const res = rsDecodeBlock(encoded.slice(0, 1 + clampedNsym), clampedNsym);
+    return {
+      bytes: new Uint8Array(0),
+      correctedErrors: res.correctedErrors,
+      uncorrectableBlocks: res.uncorrectable ? 1 : 0,
+      totalBlocks: 1,
+      blockResults: [
+        {
+          blockIndex: 0,
+          correctedErrors: res.correctedErrors,
+          uncorrectable: res.uncorrectable,
+          dataBytes: 0,
+        },
+      ],
+    };
+  }
+
+  const out = new Uint8Array(originalLength);
+  let inOffset = 0;
+  let outOffset = 0;
+  let correctedErrors = 0;
   let uncorrectableBlocks = 0;
-  let totalCorrectedSymbols = 0;
+  let blockIndex = 0;
+  const blockResults: RsDecodeReport['blockResults'] = [];
 
-  for (let b = 0; b < blockCount; b++) {
-    const remaining = originalLength - decOffset;
-    const blockDataLen = Math.min(maxDataPerBlock, remaining);
-    const blockTotalLen = blockDataLen + safeNsym;
+  while (outOffset < originalLength && inOffset < encoded.length) {
+    const remainingData = originalLength - outOffset;
+    const expectedData = Math.min(dataBlockSize, remainingData);
+    const expectedEncodedLen = expectedData + clampedNsym;
+    const blockSlice = encoded.slice(
+      inOffset,
+      Math.min(inOffset + expectedEncodedLen, encoded.length),
+    );
 
-    const codeword = new Uint8Array(blockTotalLen);
-    const available = Math.min(blockTotalLen, Math.max(0, encoded.length - encOffset));
-    if (available > 0) {
-      codeword.set(encoded.slice(encOffset, encOffset + available), 0);
+    const decoded = rsDecodeBlock(blockSlice, clampedNsym);
+    correctedErrors += decoded.correctedErrors;
+    if (decoded.uncorrectable) {
+      uncorrectableBlocks += 1;
     }
 
-    const res = rsDecodeBlock(codeword, safeNsym);
-    decoded.set(res.data.slice(0, blockDataLen), decOffset);
+    const copyLen = Math.min(decoded.data.length, remainingData);
+    out.set(decoded.data.slice(0, copyLen), outOffset);
 
-    if (res.uncorrectable) {
-      uncorrectableBlocks++;
-    } else if (res.correctedSymbols > 0) {
-      repairedBlocks++;
-      totalCorrectedSymbols += res.correctedSymbols;
-    }
+    blockResults.push({
+      blockIndex,
+      correctedErrors: decoded.correctedErrors,
+      uncorrectable: decoded.uncorrectable,
+      dataBytes: copyLen,
+    });
 
-    encOffset += blockTotalLen;
-    decOffset += blockDataLen;
+    inOffset += Math.min(fullBlockSize, expectedEncodedLen);
+    outOffset += expectedData;
+    blockIndex += 1;
   }
 
   return {
-    decoded,
-    totalBlocks: blockCount,
-    repairedBlocks,
+    bytes: out,
+    correctedErrors,
     uncorrectableBlocks,
-    totalCorrectedSymbols,
-    success: uncorrectableBlocks === 0,
+    totalBlocks: blockIndex,
+    blockResults,
   };
 }

@@ -1,145 +1,146 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { rsEncodeBlock, rsDecodeBlock, rsEncodeStream, rsDecodeStream } from './reedSolomon';
 import {
-  bytesToDnaStandard,
-  dnaStandardToBytes,
-  bytesToDnaGoldman,
-  dnaGoldmanToBytes,
-  huffmanCompress,
-  huffmanDecompress,
-  analyzeDnaSequence,
+  gfDiv,
+  gfInv,
+  gfMul,
+  rsDecode,
+  rsDecodeBlock,
+  rsEncode,
+  rsEncodeBlock,
+} from './reedSolomon';
+import {
+  analyzeSequence,
+  bytesToDna,
+  dnaToBytes,
+  encodeDnaCapsule,
   formatFasta,
+  recoverDnaCapsule,
+  simulateRadiation,
+  voteTmrCopies,
 } from './dnaCodec';
-import { analyzeSequenceWithML, extractWindowFeatures, predictWindowRisk } from './mlModel';
-import { createCapsule, simulateRadiation, recoverCapsule, runEmpiricalStressSweep } from './aeonPipeline';
+import { predictDegradation } from './degradationModel';
 
-test('Reed-Solomon GF(256) repairs up to floor(nsym/2) corrupted bytes in a block', () => {
-  const msg = new TextEncoder().encode('Project Aeon 1000-Year DNA Storage Verification Payload');
-  const nsym = 64; // Can correct up to 32 byte errors
-  const codeword = rsEncodeBlock(msg, nsym);
-  const corrupted = new Uint8Array(codeword);
+test('GF(256) multiplication, division, and multiplicative inverse hold', () => {
+  for (let a = 1; a < 256; a += 13) {
+    const inv = gfInv(a);
+    assert.equal(gfMul(a, inv), 1);
+    assert.equal(gfDiv(gfMul(a, 0x53), 0x53), a);
+  }
+});
 
-  // Corrupt 30 distinct byte positions across data and parity
+test('Reed-Solomon RS block recovers up to floor(nsym/2) byte errors', () => {
+  const payload = new TextEncoder().encode(
+    'Project Aeon: Silicon rots in decades. DNA lasts for millennia.',
+  );
+  const nsym = 64; // corrects up to 32 byte errors
+  const encoded = rsEncodeBlock(payload, nsym);
+  const corrupted = new Uint8Array(encoded);
+
+  // Inject 30 distributed byte errors (including parity bytes)
   for (let i = 0; i < 30; i++) {
-    corrupted[(i * 3) % codeword.length] ^= 0xa5;
+    const pos = (i * 4) % corrupted.length;
+    corrupted[pos] ^= (i + 17) & 0xff || 1;
   }
 
   const decoded = rsDecodeBlock(corrupted, nsym);
   assert.equal(decoded.uncorrectable, false);
-  assert.equal(decoded.correctedSymbols, 30);
-  assert.deepEqual(decoded.data, msg);
+  assert.equal(decoded.correctedErrors, 30);
+  assert.deepEqual(decoded.data, payload);
 });
 
-test('Reed-Solomon RS=150 multi-block stream encoding and decoding works accurately', () => {
-  const payload = new Uint8Array(320);
-  for (let i = 0; i < payload.length; i++) payload[i] = (i * 37 + 13) & 0xff;
-
-  const enc = rsEncodeStream(payload, 150);
-  assert.equal(enc.blockCount, 4); // 255 - 150 = 105 data bytes/block -> ceil(320/105) = 4
-
-  const corrupted = new Uint8Array(enc.encoded);
-  // Corrupt 25 bytes in first block and 25 bytes in second block
-  for (let i = 0; i < 25; i++) {
-    corrupted[i * 4] ^= 0x55;
-    corrupted[255 + i * 4] ^= 0x33;
+test('Reed-Solomon RS=150 multi-block encoding recovers heavy multi-byte corruption', () => {
+  const data = new Uint8Array(320);
+  for (let i = 0; i < data.length; i++) {
+    data[i] = (i * 37 + 11) & 0xff;
   }
 
-  const dec = rsDecodeStream(corrupted, payload.length, 150);
-  assert.equal(dec.success, true);
-  assert.equal(dec.totalCorrectedSymbols, 50);
-  assert.deepEqual(dec.decoded, payload);
+  const encoded = rsEncode(data, 150); // dataBlockSize = 105, max errors = 75 per block
+  assert.equal(encoded.blockCount, 4);
+
+  const corrupted = new Uint8Array(encoded.bytes);
+  // Corrupt 50 bytes in block 0
+  for (let i = 0; i < 50; i++) {
+    corrupted[i * 3] ^= 0xa5;
+  }
+
+  const report = rsDecode(corrupted, 150, data.length);
+  assert.equal(report.uncorrectableBlocks, 0);
+  assert.equal(report.correctedErrors, 50);
+  assert.deepEqual(report.bytes, data);
 });
 
-test('Goldman Base-3 codec is lossless and guarantees zero homopolymers (maxRun === 1)', () => {
-  // Include 0x00 and 0xFF runs which produce severe AAAA/TTTT homopolymers in standard 2-bit coding
-  const bytes = new Uint8Array([0x00, 0x00, 0x00, 0xff, 0xff, 0x55, 0xaa, 0x12, 0x34, 0xde, 0xad]);
-  const stdDna = bytesToDnaStandard(bytes);
-  assert.deepEqual(dnaStandardToBytes(stdDna), bytes);
-  assert.ok(analyzeDnaSequence(stdDna, bytes.length).maxHomopolymer >= 8);
-
-  const goldmanDna = bytesToDnaGoldman(bytes);
-  assert.deepEqual(dnaGoldmanToBytes(goldmanDna), bytes);
-  const metrics = analyzeDnaSequence(goldmanDna, bytes.length);
-  assert.equal(metrics.maxHomopolymer, 1);
+test('Binary-to-DNA and DNA-to-Binary roundtrip is bit-perfect', () => {
+  const input = new TextEncoder().encode('ATCG-Aeon-2026-Binary-DNA!');
+  const dna = bytesToDna(input);
+  assert.equal(dna.length, input.length * 4);
+  assert.match(dna, /^[ACGT]+$/);
+  const restored = dnaToBytes(dna);
+  assert.deepEqual(restored, input);
 });
 
-test('Canonical Huffman compression is lossless on compressible text and bypasses incompressible data', () => {
-  const text = new TextEncoder().encode(
-    'AAAABBBBCCCCDDDD Project Aeon Project Aeon Project Aeon DNA lasts for millennia. '.repeat(4)
-  );
-  const comp = huffmanCompress(text);
-  assert.equal(comp.compressed, true);
-  assert.ok(comp.outputSize < comp.originalSize);
-  assert.deepEqual(huffmanDecompress(comp.bytes), text);
+test('TMR majority voting repairs single-strand mutations across 3 copies', () => {
+  const base = 'ACGTACGTACGTACGT';
+  const c0 = 'TCGTACGTACGTACGT'; // mutated idx 0
+  const c1 = 'ACGTCCGTACGTACGT'; // mutated idx 4
+  const c2 = 'ACGTACGTACGTACGA'; // mutated idx 15
 
-  const tiny = new Uint8Array([1, 2, 3, 4]);
-  const raw = huffmanCompress(tiny);
-  assert.equal(raw.compressed, false);
-  assert.deepEqual(huffmanDecompress(raw.bytes), tiny);
+  const voted = voteTmrCopies([c0, c1, c2]);
+  assert.equal(voted.votedDna, base);
+  assert.equal(voted.votedRepairedLoci, 3);
+  assert.equal(voted.threeWayDisagreements, 0);
 });
 
-test('End-to-end 1000-year DNA capsule achieves 100% bit-perfect recovery under 45 mutations', () => {
-  const original = new TextEncoder().encode(
-    'Silicon rots in decades. DNA lasts for millennia. — Project Aeon Archive Specimen #01'
-  );
-  const capsule = createCapsule(original, 'text', {
-    scheme: 'goldman-base3',
-    rsParity: 64,
-    huffmanEnabled: true,
+test('Full Aeon pipeline recovers 100% of text after 120 simulated radiation mutations', () => {
+  const message =
+    'Voyager Golden Record Archive: Project Aeon 1000-Year DNA Storage Protocol.';
+  const payload = new TextEncoder().encode(message);
+  const capsule = encodeDnaCapsule(payload, {
+    rsNsym: 150,
     tmrEnabled: true,
-    env: { storageYears: 1000, temperatureC: -20, radiationMSvPerYear: 2.4 },
+    capsuleId: 'TEST-ARC-01',
   });
 
-  assert.equal(capsule.bioMetrics.maxHomopolymer, 1);
-  assert.ok(capsule.fasta.startsWith('>AEON|'));
+  const sim = simulateRadiation(capsule, 120, 42);
+  assert.equal(sim.totalMutationsApplied, 360);
 
-  const irradiated = simulateRadiation(capsule, 45, 1000, 1337);
-  assert.equal(irradiated.mutations.length, 45);
+  const report = recoverDnaCapsule(capsule, sim);
+  assert.equal(report.exactMatch, true);
+  assert.equal(report.byteIntegrityPercent, 100);
+  assert.equal(new TextDecoder().decode(report.recoveredBytes), message);
 
-  const report = recoverCapsule(irradiated, true);
-  assert.equal(report.bitPerfect, true);
-  assert.equal(report.byteAccuracyPct, 100);
-  assert.equal(report.berAfterRepair, 0);
-  assert.deepEqual(report.recoveredBytes, original);
-});
+  const metrics = analyzeSequence(capsule.encodedDna);
+  assert.equal(metrics.codingDensityBitsPerNt, 2.0);
+  assert.ok(metrics.gcPercent > 0 && metrics.gcPercent < 100);
 
-test('ML stability predictor flags severe homopolymer + warm storage as higher risk than Goldman cryo', () => {
-  const badSeq = 'AAAAAAAAAAAAAAAACCCCCCCCCCCCCCCC';
-  const goodSeq = 'ACGTACGTGCATGCATACGTACGTGCATGCAT';
-
-  const hotEnv = { storageYears: 2000, temperatureC: 25, radiationMSvPerYear: 12 };
-  const cryoEnv = { storageYears: 100, temperatureC: -80, radiationMSvPerYear: 0.5 };
-
-  const badRisk = predictWindowRisk(extractWindowFeatures(badSeq, hotEnv).features);
-  const goodRisk = predictWindowRisk(extractWindowFeatures(goodSeq, cryoEnv).features);
-
-  assert.ok(badRisk > goodRisk + 0.25, `Expected badRisk (${badRisk}) >> goodRisk (${goodRisk})`);
-
-  const report = analyzeSequenceWithML(goodSeq.repeat(3), cryoEnv);
-  assert.ok(report.predictedSurvivalPct > 90);
-});
-
-test('FASTA formatter wraps at 80 chars and outputs 3 TMR strands', () => {
-  const strand = 'ACGT'.repeat(30); // 120 bp
-  const fasta = formatFasta({
-    capsuleId: 'AEON-TEST',
-    strands: [strand, strand, strand],
-    scheme: 'standard-2bit',
-    rsParity: 64,
-    huffmanEnabled: false,
-    payloadType: 'text',
-    originalByteLength: 30,
-    encodedPayloadLength: 30,
+  const fasta = formatFasta(capsule.capsuleId, capsule.encodedDna, {
+    payloadType: 'TEXT',
+    gcPercent: metrics.gcPercent,
+    rsNsym: 150,
+    tmrEnabled: true,
+    originalBytes: payload.length,
   });
-  const headers = fasta.split('\n').filter((l) => l.startsWith('>AEON|'));
-  assert.equal(headers.length, 3);
+  assert.ok(fasta.startsWith('>TEST-ARC-01|PROJECT_AEON|'));
 });
 
-test('Empirical stress sweep executes cleanly and shows RS+TMR outperforms raw DNA', () => {
-  const sweep = runEmpiricalStressSweep('Project Aeon Stress Verification', 64);
-  assert.ok(sweep.length >= 5);
-  const at45 = sweep.find((p) => p.mutations === 45)!;
-  assert.equal(at45.aeonMlSoftRecoveryPct, 100);
-  assert.ok(at45.aeonMlSoftRecoveryPct >= at45.rawRecoveryPct);
+test('Degradation prediction model predicts higher survival at -80C than +20C', () => {
+  const cryo = predictDegradation({
+    years: 1000,
+    temperatureC: -80,
+    strandLengthBp: 2000,
+    rsNsym: 150,
+    tmrEnabled: true,
+  });
+
+  const ambient = predictDegradation({
+    years: 1000,
+    temperatureC: 20,
+    strandLengthBp: 2000,
+    rsNsym: 150,
+    tmrEnabled: true,
+  });
+
+  assert.ok(cryo.halfLifeYears > ambient.halfLifeYears);
+  assert.ok(cryo.aeonSurvivalPct >= ambient.aeonSurvivalPct);
+  assert.equal(cryo.curve.length, 21);
 });
