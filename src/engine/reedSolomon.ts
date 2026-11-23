@@ -246,7 +246,7 @@ function correctErrata(
     }
 
     const y = polyEval(errEval, XiInv);
-    const magnitude = gfDiv(gfMul(X[i], y), errLocPrime);
+    const magnitude = gfDiv(y, errLocPrime);
     E[errPos[i]] = magnitude;
   }
 

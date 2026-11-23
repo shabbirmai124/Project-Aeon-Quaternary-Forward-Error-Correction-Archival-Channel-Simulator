@@ -182,7 +182,7 @@ class PureReedSolomon:
             for cp2 in coef_pos:
                 if cp2 != cp:
                     denom = _gf_mul(denom, 1 ^ _gf_mul(xi_inv, _GF_EXP[cp2]))
-            mag = _gf_div(_gf_mul(x_val, _poly_eval(err_eval, xi_inv)), denom)
+            mag = _gf_div(_poly_eval(err_eval, xi_inv), denom)
             msg[pos] ^= mag
 
         return bytes(msg[:data_len]), errs
