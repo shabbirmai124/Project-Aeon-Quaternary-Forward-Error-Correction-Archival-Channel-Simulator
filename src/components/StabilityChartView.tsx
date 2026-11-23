@@ -1,5 +1,9 @@
 import React, { useMemo, useState } from 'react';
 import { predictDegradation } from '../engine/degradationModel';
+import {
+  runHundredYearProofBenchmark,
+  trainDegradationMlModel,
+} from '../engine/mlPredictor';
 
 interface StabilityChartViewProps {
   years: number;
@@ -7,6 +11,7 @@ interface StabilityChartViewProps {
   strandLengthBp: number;
   rsNsym: number;
   tmrEnabled: boolean;
+  payloadBytes: Uint8Array;
 }
 
 const REGIMES = [
@@ -23,9 +28,18 @@ export const StabilityChartView: React.FC<StabilityChartViewProps> = ({
   strandLengthBp,
   rsNsym,
   tmrEnabled,
+  payloadBytes,
 }) => {
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
   const [scaleMode, setScaleMode] = useState<'horizon' | 'halflife'>('halflife');
+  const [mlSeed, setMlSeed] = useState(2026);
+
+  const mlModel = useMemo(() => trainDegradationMlModel(140, mlSeed), [mlSeed]);
+
+  const proofBenchmark = useMemo(
+    () => runHundredYearProofBenchmark(mlModel, payloadBytes, rsNsym, tmrEnabled, 30),
+    [mlModel, payloadBytes, rsNsym, tmrEnabled],
+  );
 
   const basePrediction = useMemo(
     () =>
@@ -404,6 +418,143 @@ export const StabilityChartView: React.FC<StabilityChartViewProps> = ({
               })}
             </tbody>
           </table>
+        </div>
+      </section>
+
+      {/* Trained ML Model & 100-Year 100% Recovery Proof */}
+      <section className="rounded-lg border border-slate-200 bg-white p-5">
+        <div className="flex flex-wrap items-center justify-between gap-4 border-b border-slate-100 pb-4">
+          <div>
+            <h3 className="text-base font-semibold text-slate-900">
+              Trained ML Predictor &amp; 100-Year Bit-Perfect Proof
+            </h3>
+            <p className="mt-0.5 text-xs text-slate-500">
+              Gradient-descent Logistic Classifier + Ridge Regressor trained on {mlModel.metrics.sampleCount} simulated archival runs ({mlModel.metrics.trainCount} train / {mlModel.metrics.testCount} held-out test), verified with 30 Monte Carlo encoding-mutation-recovery trials per regime.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={() => setMlSeed((s) => s + 17)}
+            className="rounded-md bg-blue-600 px-3 py-1.5 text-xs font-semibold text-white transition-colors hover:bg-blue-700 whitespace-nowrap cursor-pointer"
+          >
+            Retrain ML &amp; Run 100-Yr Proof
+          </button>
+        </div>
+
+        {/* ML Training Metrics Row */}
+        <div className="mt-4 grid grid-cols-1 gap-4 rounded-md border border-slate-200 bg-slate-50 p-4 sm:grid-cols-4">
+          <div>
+            <div className="text-xs text-slate-500">Held-Out Test Accuracy</div>
+            <div className="mt-1 font-mono text-lg font-semibold text-slate-900 tabular-nums">
+              {mlModel.metrics.testAccuracyPct.toFixed(1)}%
+            </div>
+            <div className="font-mono text-[11px] text-slate-500">
+              Train: {mlModel.metrics.trainAccuracyPct.toFixed(1)}%
+            </div>
+          </div>
+          <div>
+            <div className="text-xs text-slate-500">Error Regressor R²</div>
+            <div className="mt-1 font-mono text-lg font-semibold text-slate-900 tabular-nums">
+              {mlModel.metrics.rSquaredErrors.toFixed(3)}
+            </div>
+            <div className="font-mono text-[11px] text-slate-500">
+              Seed #{mlSeed}
+            </div>
+          </div>
+          <div>
+            <div className="text-xs text-slate-500">BCE Loss Convergence</div>
+            <div className="mt-1 font-mono text-lg font-semibold text-blue-700 tabular-nums">
+              {mlModel.metrics.lossHistory[0]?.bceLoss.toFixed(3)} →{' '}
+              {mlModel.metrics.lossHistory[
+                mlModel.metrics.lossHistory.length - 1
+              ]?.bceLoss.toFixed(3)}
+            </div>
+            <div className="font-mono text-[11px] text-slate-500">
+              {mlModel.metrics.epochs} gradient epochs
+            </div>
+          </div>
+          <div>
+            <div className="text-xs text-slate-500">100-Year Empirical Proof</div>
+            <div className="mt-1 font-mono text-lg font-semibold text-emerald-700 tabular-nums">
+              {proofBenchmark[0]?.successRatePct.toFixed(1)}%
+            </div>
+            <div className="font-mono text-[11px] text-slate-500">
+              {proofBenchmark[0]?.bitPerfectTrials}/{proofBenchmark[0]?.trials} bit-perfect
+            </div>
+          </div>
+        </div>
+
+        {/* 100-Year & 1000-Year Proof Table */}
+        <div className="mt-4 overflow-x-auto">
+          <table className="w-full border-collapse text-left font-mono text-xs tabular-nums">
+            <thead>
+              <tr className="border-b border-slate-200 text-slate-500">
+                <th className="py-2 pr-4 font-medium">Verification Scenario</th>
+                <th className="py-2 px-3 font-medium">Mutations / Strand</th>
+                <th className="py-2 px-3 font-medium">Avg RS Repaired</th>
+                <th className="py-2 px-3 font-medium">ML P(Recovery)</th>
+                <th className="py-2 px-3 font-medium">Empirical Pass</th>
+                <th className="py-2 pl-3 font-medium">Result</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100">
+              {proofBenchmark.map((row) => (
+                <tr key={row.label} className="hover:bg-slate-50">
+                  <td className="py-2.5 pr-4 font-sans font-medium text-slate-900">
+                    {row.label}
+                  </td>
+                  <td className="py-2.5 px-3 text-slate-700">
+                    {row.avgMutationsPerStrand} nt
+                  </td>
+                  <td className="py-2.5 px-3 text-slate-700">
+                    {row.avgRsBytesRepaired.toFixed(1)} B
+                  </td>
+                  <td className="py-2.5 px-3 text-blue-700">
+                    {row.mlPredictedRecoveryPct.toFixed(1)}%
+                  </td>
+                  <td className="py-2.5 px-3 font-semibold text-slate-900">
+                    {row.bitPerfectTrials}/{row.trials} ({row.successRatePct.toFixed(1)}%)
+                  </td>
+                  <td className="py-2.5 pl-3">
+                    {row.successRatePct === 100 ? (
+                      <span className="font-semibold text-emerald-700">
+                        ● 100% Verified
+                      </span>
+                    ) : (
+                      <span className="text-amber-700">▲ Partial</span>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+
+        {/* Learned Model Feature Weights */}
+        <div className="mt-5 border-t border-slate-100 pt-4">
+          <h4 className="text-xs font-semibold tracking-wider text-slate-600 uppercase">
+            Learned Model Feature Weights
+          </h4>
+          <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-5">
+            {mlModel.metrics.featureWeights.map((fw) => (
+              <div
+                key={fw.feature}
+                className="rounded border border-slate-200 bg-slate-50 px-3 py-2"
+              >
+                <div className="text-[11px] font-medium text-slate-600 truncate" title={fw.feature}>
+                  {fw.feature}
+                </div>
+                <div className="mt-1 font-mono text-xs font-semibold text-slate-900 tabular-nums">
+                  w_cls: {fw.classifierWeight >= 0 ? '+' : ''}
+                  {fw.classifierWeight.toFixed(2)}
+                </div>
+                <div className="font-mono text-[11px] text-slate-500 tabular-nums">
+                  w_err: {fw.errorRegressorWeight >= 0 ? '+' : ''}
+                  {fw.errorRegressorWeight.toFixed(3)}
+                </div>
+              </div>
+            ))}
+          </div>
         </div>
       </section>
     </div>

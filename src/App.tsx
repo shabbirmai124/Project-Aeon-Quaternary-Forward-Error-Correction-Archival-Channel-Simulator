@@ -274,6 +274,7 @@ export const App: React.FC = () => {
                 strandLengthBp={capsule.metrics.lengthBp}
                 rsNsym={controls.rsNsym}
                 tmrEnabled={controls.tmrEnabled}
+                payloadBytes={payloadBytes}
               />
             )}
 

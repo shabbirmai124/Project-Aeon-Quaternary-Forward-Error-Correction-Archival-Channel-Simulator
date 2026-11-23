@@ -20,6 +20,11 @@ import {
   voteTmrCopies,
 } from './dnaCodec';
 import { predictDegradation } from './degradationModel';
+import {
+  predictRecoveryWithMl,
+  runHundredYearProofBenchmark,
+  trainDegradationMlModel,
+} from './mlPredictor';
 
 test('GF(256) multiplication, division, and multiplicative inverse hold', () => {
   for (let a = 1; a < 256; a += 13) {
@@ -143,4 +148,30 @@ test('Degradation prediction model predicts higher survival at -80C than +20C', 
   assert.ok(cryo.halfLifeYears > ambient.halfLifeYears);
   assert.ok(cryo.aeonSurvivalPct >= ambient.aeonSurvivalPct);
   assert.equal(cryo.curve.length, 21);
+});
+
+test('ML degradation model trains with decreasing loss and proves 100% recovery at 100 years and 1000 years', () => {
+  const model = trainDegradationMlModel(140, 2026);
+  const history = model.metrics.lossHistory;
+  assert.ok(history.length > 2);
+  assert.ok(history[history.length - 1].bceLoss < history[0].bceLoss);
+  assert.ok(model.metrics.testAccuracyPct >= 85);
+
+  const pred100Cryo = predictRecoveryWithMl(model, {
+    years: 100,
+    temperatureC: -80,
+    rsNsym: 150,
+    tmrEnabled: true,
+  });
+  assert.ok(pred100Cryo.recoveryProbabilityPct > 90);
+
+  const payload = new TextEncoder().encode(
+    'Project Aeon 100-Year Verification Sequence: A-C-G-T Archive.',
+  );
+  const benchmark = runHundredYearProofBenchmark(model, payload, 150, true, 25);
+  assert.equal(benchmark.length, 4);
+  for (const row of benchmark) {
+    assert.equal(row.successRatePct, 100);
+    assert.equal(row.bitPerfectTrials, 25);
+  }
 });
