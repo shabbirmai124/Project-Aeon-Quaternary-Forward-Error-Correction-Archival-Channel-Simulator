@@ -1,0 +1,5 @@
+{
+  "name": "Project Aeon — 1000-Year DNA Data Archive",
+  "description": "Synthetic DNA data storage engine with Reed-Solomon forward error correction, Triple Modular Redundancy, 1000-year radiation simulation, ML degradation prediction, and lab-ready FASTA export.",
+  "requestFramePermissions": []
+}
